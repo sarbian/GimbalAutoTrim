@@ -13,6 +13,7 @@ using UnityEngine;
 
 namespace GimbalAutoTrim
 {
+    [KSPModule("Auto-Trim")]
     public class ModuleGimbalAutoTrim : ModuleGimbal
     {
 
@@ -39,43 +40,28 @@ namespace GimbalAutoTrim
             initalRots = new List<Quaternion>();
             foreach (Quaternion q in initRots)
                 initalRots.Add(q);
-
-            if (this.gimbalAutoTrim)
-                AlignGimbal();
-            else
-                UnalignGimbal();
         }
 
-        [KSPField(isPersistant = true)]
+        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Auto-Trim"),
+        UI_Toggle(scene = UI_Scene.All)]
         public bool gimbalAutoTrim = false;
 
-        [KSPField(isPersistant = false)]
-        public float trimLimit = 45;
+        [KSPField(isPersistant = true, guiActive = false, guiActiveEditor = true, guiName = "Auto-Trim Limit"),
+        UI_FloatRange(minValue = 0f, maxValue = 90f, scene = UI_Scene.Editor, stepIncrement = 5f)]
+        public float trimLimit = 45f;
+
+        [KSPField(isPersistant = false, guiActive = false, guiName = "Angle")]
+        public string trimStatus = "";
+
+        [KSPField(isPersistant = false, guiActive = true, guiName = "correction")]
+        public string correction = "";
+
+        [KSPField(isPersistant = false, guiActive = true, guiName = "trimAngle")]
+        public string trimAngle = "";
 
         public override string GetInfo()
         {
             return base.GetInfo();
-        }
-
-        [KSPEvent(guiName = "Auto-Trim Gimbal", guiActive = true, guiActiveEditor = true)]
-        public void AlignGimbal()
-        {
-            this.gimbalAutoTrim = true;
-            this.Events["AlignGimbal"].active = false;
-            this.Events["UnalignGimbal"].active = true;
-        }
-
-        [KSPEvent(guiName = "Disable Auto-Trim Gimbal", guiActive = true, guiActiveEditor = true)]
-        public void UnalignGimbal()
-        {
-            this.gimbalAutoTrim = false;
-            this.Events["AlignGimbal"].active = true;
-            this.Events["UnalignGimbal"].active = false;
-
-            for (int i = 0; i < this.initalRots.Count(); i++)
-            {
-                this.initRots[i] = initalRots[i];
-            }
         }
 
         public ThrustInfo updateThrust()
@@ -113,8 +99,7 @@ namespace GimbalAutoTrim
                     List<Vector3> forwards;
                     if (gimbal != null)
                     {
-                        // ModuleGimbal.initRots is protected :(
-                        List<Quaternion> initRots = (List<Quaternion>)(typeof(ModuleGimbal).GetField("initRots", BindingFlags.NonPublic | BindingFlags.GetField | BindingFlags.Instance).GetValue(gimbal));
+                        List<Quaternion> initRots = gimbal.initRots;
                         forwards = new List<Vector3>(initRots.Count);
                         for (int i = 0; i < initRots.Count; i++)
                         {
@@ -168,6 +153,8 @@ namespace GimbalAutoTrim
             if (HighLogic.LoadedSceneIsEditor || this.vessel == null)
                 return;
 
+            Fields["trimStatus"].guiActive = this.gimbalAutoTrim;
+
             if (this.gimbalAutoTrim)
             {
                 ThrustInfo ti;
@@ -187,27 +174,39 @@ namespace GimbalAutoTrim
                                 
                 if (ti.thrustAligned > 0f)
                 {
-                    Vector3 optimalDir = ti.cotAll - ti.com;
-                    Vector3 currentDir = ti.dotOther + ti.dotAligned;
+                    Vector3 optimalDot = ti.cotAll - ti.com;
+                    Vector3 currentDot = ti.dotOther + ti.dotAligned;
+                    
+                    // CoT in front of CoM
+                    if (Vector3.Dot(optimalDot, currentDot) < 0f)
+                        optimalDot = -optimalDot;
+                    
+                    // We work in a 2D plane whose axis are correction and optimalDot 
+                    // correction is the perpendicular to optimalDot in the plane defined by optimalDot/currentDot 
+                    Vector3 correction = Vector3.Exclude(optimalDot, currentDot);
+                    this.correction = PrettyPrint(correction,"F2");
 
-                    Vector3 correction = Vector3.Exclude(optimalDir, currentDir);
+                    float thrustAlignedX = Vector3.Exclude(optimalDot, ti.dotAligned).magnitude;
 
-                    float x = Mathf.Min(correction.magnitude, ti.thrustAligned);
+                    float x = Mathf.Clamp(thrustAlignedX - correction.magnitude, -ti.thrustAligned, ti.thrustAligned);
 
                     float y = Mathf.Sqrt(ti.thrustAligned * ti.thrustAligned - x * x);
 
-                    Vector3 trimedDotAligned = -correction.normalized * x + optimalDir.normalized * y;
-
+                    Vector3 trimedDotAligned = correction.normalized * x + optimalDot.normalized * y;
+                    
                     float trimAngle = Vector3.Angle(ti.dotAligned, trimedDotAligned);
+                    this.trimAngle = trimAngle.ToString("F2");
 
                     Quaternion trimRotation = Quaternion.FromToRotation(ti.dotAligned, trimedDotAligned);
 
                     //print("optimalDir " + PrettyPrint(optimalDir) + " currentDir " + PrettyPrint(currentDir) + " correction " + PrettyPrint(correction) + " angle " + Vector3.Angle(currentDir, optimalDir).ToString("F2") + " cAngle " + trimAngle.ToString("F3"));
 
+                    float trimRatio = Mathf.Min(trimLimit / trimAngle, 1f);
+                    
+                    this.trimStatus = (trimAngle * trimRatio).ToString("F1") + " deg";
+
                     for (int i = 0; i < this.initRots.Count(); i++)
-                    {
-                        float trimRatio = Mathf.Min(trimLimit / trimAngle, 1f);
-                        
+                    {   
                         gimbalTransforms[i].localRotation = initalRots[i];
                         gimbalTransforms[i].forward = Quaternion.Lerp( Quaternion.identity, trimRotation, trimRatio) * gimbalTransforms[i].forward;
                         this.initRots[i] = gimbalTransforms[i].localRotation;
@@ -221,9 +220,23 @@ namespace GimbalAutoTrim
                     }
                 }
             }
+            else
+            {
+                for (int i = 0; i < this.initalRots.Count(); i++)
+                {
+                    this.initRots[i] = initalRots[i];
+                }
+            }
 
             base.OnFixedUpdate();
         }
+
+
+        //public override void OnUpdate()
+        //{
+            
+        //    base.OnUpdate();
+        //}
 
         public static string PrettyPrint(Vector3d vector, string format = "F3")
         {
